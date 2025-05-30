@@ -1,3 +1,5 @@
+//background_service.dart
+
 import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/widgets.dart';
@@ -10,6 +12,7 @@ import 'network_service.dart';
 import 'location_service.dart';
 import 'database_helper.dart';
 
+@pragma('vm:entry-point')
 class BackgroundService {
   static final BackgroundService _instance = BackgroundService._internal();
   factory BackgroundService() => _instance;
@@ -23,6 +26,9 @@ class BackgroundService {
 
   Future<void> initializeService() async {
     final service = FlutterBackgroundService();
+
+    // Create notification channel first
+    await _createNotificationChannel();
 
     // Configure Android-specific settings
     await service.configure(
@@ -49,6 +55,26 @@ class BackgroundService {
     if (!isRunning) {
       await service.startService();
     }
+  }
+
+  // Create notification channel for Android
+  Future<void> _createNotificationChannel() async {
+    final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+        FlutterLocalNotificationsPlugin();
+
+    const AndroidNotificationChannel channel = AndroidNotificationChannel(
+      notificationChannelId,
+      'Network Monitor Service',
+      description: 'This channel is used for network monitoring service notifications.',
+      importance: Importance.low, // Use low importance to avoid intrusive notifications
+      enableLights: false,
+      enableVibration: false,
+      showBadge: false,
+    );
+
+    await flutterLocalNotificationsPlugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(channel);
   }
 
   // Initialize local notifications
@@ -89,6 +115,9 @@ class BackgroundService {
 
     print('Background service started');
 
+    // Add a small delay to ensure everything is properly initialized
+    await Future.delayed(const Duration(seconds: 1));
+
     try {
       // Initialize database helper
       final dbHelper = DatabaseHelper.instance;
@@ -105,6 +134,14 @@ class BackgroundService {
       
       final metricsCount = await dbHelper.getMetricsCount();
       print('Current metrics count: $metricsCount');
+
+      // Set initial notification for Android
+      if (service is AndroidServiceInstance) {
+        service.setForegroundNotificationInfo(
+          title: 'Network Monitor Starting',
+          content: 'Initializing network monitoring...',
+        );
+      }
 
       // Handle service messages
       service.on('stopService').listen((event) {
@@ -173,13 +210,31 @@ class BackgroundService {
         await _syncDataWithRemoteDatabase(dbHelper);
       });
 
+      // Initial notification update
+      if (service is AndroidServiceInstance) {
+        final totalCount = await dbHelper.getMetricsCount();
+        service.setForegroundNotificationInfo(
+          title: 'Network Monitor Ready',
+          content: 'Monitoring started. Current metrics: $totalCount',
+        );
+      }
+
       print('Background service initialized successfully');
 
     } catch (e) {
       print('Error starting background service: $e');
+      
+      // Update notification to show initialization error
+      if (service is AndroidServiceInstance) {
+        service.setForegroundNotificationInfo(
+          title: 'Network Monitor Error',
+          content: 'Failed to initialize: ${e.toString().substring(0, 50)}...',
+        );
+      }
     }
   }
 
+  @pragma('vm:entry-point')
   static Future<NetworkMetrics> _collectNetworkMetrics(NetworkService networkService) async {
     // Add timeout to prevent hanging
     final completer = Completer<NetworkMetrics>();
@@ -230,6 +285,7 @@ class BackgroundService {
     return completer.future;
   }
 
+  @pragma('vm:entry-point')
   static Future<void> _syncDataWithRemoteDatabase(DatabaseHelper dbHelper) async {
     try {
       // Get unsynced records using DatabaseHelper
