@@ -93,9 +93,21 @@ class DatabaseHelper {
     }
   }
 
-  // Insert network metrics
-  Future<int> insertMetrics(NetworkMetrics metrics, String location) async {
+  // Insert network metrics - improved version with better location handling
+  Future<int> insertMetrics(NetworkMetrics metrics, [dynamic location]) async {
     final db = await database;
+    
+    // Handle different location formats
+    String locationString = 'Unknown';
+    if (location != null) {
+      if (location is Map<String, double>) {
+        if (location.containsKey('latitude') && location.containsKey('longitude')) {
+          locationString = '${location['latitude']!.toStringAsFixed(6)},${location['longitude']!.toStringAsFixed(6)}';
+        }
+      } else if (location is String && location.isNotEmpty) {
+        locationString = location;
+      }
+    }
     
     final data = {
       'networkType': metrics.networkType,
@@ -105,14 +117,14 @@ class DatabaseHelper {
       'downloadSpeed': metrics.downloadSpeed,
       'uploadSpeed': metrics.uploadSpeed,
       'provider': metrics.provider,
-      'location': location,
+      'location': locationString,
       'timestamp': metrics.timestamp.toIso8601String(),
       'synced': 0,
     };
     
     try {
       final id = await db.insert(_tableName, data, conflictAlgorithm: ConflictAlgorithm.replace);
-      print('Metrics inserted with ID: $id');
+      print('Metrics inserted with ID: $id (Location: $locationString)');
       return id;
     } catch (e) {
       print('Error inserting metrics: $e');
@@ -133,6 +145,24 @@ class DatabaseHelper {
       return result;
     } catch (e) {
       print('Error retrieving metrics: $e');
+      rethrow;
+    }
+  }
+
+  // Get recent metrics with limit
+  Future<List<Map<String, dynamic>>> getRecentMetrics({int limit = 50}) async {
+    final db = await database;
+    
+    try {
+      final result = await db.query(
+        _tableName,
+        orderBy: 'timestamp DESC',
+        limit: limit,
+      );
+      print('Retrieved ${result.length} recent metrics records');
+      return result;
+    } catch (e) {
+      print('Error retrieving recent metrics: $e');
       rethrow;
     }
   }
@@ -159,6 +189,11 @@ class DatabaseHelper {
   // Mark records as synced
   Future<int> markAsSynced(List<int> ids) async {
     final db = await database;
+    
+    if (ids.isEmpty) {
+      print('No IDs provided to mark as synced');
+      return 0;
+    }
     
     try {
       final batch = db.batch();
@@ -215,6 +250,36 @@ class DatabaseHelper {
     }
   }
 
+  // Get synced metrics count
+  Future<int> getSyncedMetricsCount() async {
+    final db = await database;
+    
+    try {
+      final result = await db.rawQuery('SELECT COUNT(*) FROM $_tableName WHERE synced = 1');
+      final count = Sqflite.firstIntValue(result) ?? 0;
+      print('Synced metrics count: $count');
+      return count;
+    } catch (e) {
+      print('Error getting synced metrics count: $e');
+      return 0;
+    }
+  }
+
+  // Get unsynced metrics count
+  Future<int> getUnsyncedMetricsCount() async {
+    final db = await database;
+    
+    try {
+      final result = await db.rawQuery('SELECT COUNT(*) FROM $_tableName WHERE synced = 0');
+      final count = Sqflite.firstIntValue(result) ?? 0;
+      print('Unsynced metrics count: $count');
+      return count;
+    } catch (e) {
+      print('Error getting unsynced metrics count: $e');
+      return 0;
+    }
+  }
+
   // Clear all data (for debugging)
   Future<void> clearAllData() async {
     final db = await database;
@@ -224,6 +289,25 @@ class DatabaseHelper {
       print('Deleted $deletedCount records');
     } catch (e) {
       print('Error clearing data: $e');
+      rethrow;
+    }
+  }
+
+  // Clear old synced data (keep only recent records)
+  Future<int> clearOldSyncedData({int keepRecentDays = 7}) async {
+    final db = await database;
+    
+    try {
+      final cutoffDate = DateTime.now().subtract(Duration(days: keepRecentDays));
+      final deletedCount = await db.delete(
+        _tableName,
+        where: 'synced = 1 AND timestamp < ?',
+        whereArgs: [cutoffDate.toIso8601String()],
+      );
+      print('Deleted $deletedCount old synced records (older than $keepRecentDays days)');
+      return deletedCount;
+    } catch (e) {
+      print('Error clearing old synced data: $e');
       rethrow;
     }
   }
@@ -245,6 +329,46 @@ class DatabaseHelper {
     }
   }
 
+  // Get database statistics
+  Future<Map<String, dynamic>> getDatabaseStats() async {
+    try {
+      final totalCount = await getMetricsCount();
+      final syncedCount = await getSyncedMetricsCount();
+      final unsyncedCount = await getUnsyncedMetricsCount();
+      
+      final db = await database;
+      final oldestRecord = await db.query(
+        _tableName,
+        orderBy: 'timestamp ASC',
+        limit: 1,
+      );
+      
+      final newestRecord = await db.query(
+        _tableName,
+        orderBy: 'timestamp DESC',
+        limit: 1,
+      );
+      
+      return {
+        'totalCount': totalCount,
+        'syncedCount': syncedCount,
+        'unsyncedCount': unsyncedCount,
+        'syncPercentage': totalCount > 0 ? (syncedCount / totalCount * 100).toStringAsFixed(1) : '0.0',
+        'oldestRecord': oldestRecord.isNotEmpty ? oldestRecord.first['timestamp'] : null,
+        'newestRecord': newestRecord.isNotEmpty ? newestRecord.first['timestamp'] : null,
+        'tableExists': await tableExists(),
+      };
+    } catch (e) {
+      print('Error getting database stats: $e');
+      return {
+        'error': e.toString(),
+        'totalCount': 0,
+        'syncedCount': 0,
+        'unsyncedCount': 0,
+      };
+    }
+  }
+
   // Close database
   Future<void> close() async {
     final db = _database;
@@ -252,6 +376,20 @@ class DatabaseHelper {
       await db.close();
       _database = null;
       print('Database closed');
+    }
+  }
+
+  // Reset database (for debugging/testing)
+  Future<void> resetDatabase() async {
+    try {
+      await close();
+      final dbPath = await getDatabasesPath();
+      final path = join(dbPath, _databaseName);
+      await deleteDatabase(path);
+      print('Database reset successfully');
+    } catch (e) {
+      print('Error resetting database: $e');
+      rethrow;
     }
   }
 }
