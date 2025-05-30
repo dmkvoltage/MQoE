@@ -26,9 +26,6 @@ class DatabaseHelper {
     final path = join(dbPath, _databaseName);
     
     print('Database path: $path');
-
-    // Make sure to delete any existing database to start fresh
-    await deleteDatabase(path);
     
     return await openDatabase(
       path,
