@@ -1,14 +1,14 @@
 import 'dart:async';
 import 'dart:ui';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_background_service_android/flutter_background_service_android.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:path/path.dart';
 import '../models/network_metrics.dart';
 import 'network_service.dart';
 import 'location_service.dart';
+import 'database_helper.dart';
 
 class BackgroundService {
   static final BackgroundService _instance = BackgroundService._internal();
@@ -19,6 +19,7 @@ class BackgroundService {
   static const String notificationId = 'network_monitor_notification';
   static const int _syncInterval = 15; // minutes
   static Timer? _syncTimer;
+  static Timer? _metricsTimer;
 
   Future<void> initializeService() async {
     final service = FlutterBackgroundService();
@@ -42,7 +43,12 @@ class BackgroundService {
     );
 
     await setupLocalNotifications();
-    service.startService();
+    
+    // Start the service
+    final isRunning = await service.isRunning();
+    if (!isRunning) {
+      await service.startService();
+    }
   }
 
   // Initialize local notifications
@@ -77,121 +83,309 @@ class BackgroundService {
 
   @pragma('vm:entry-point')
   static void onStart(ServiceInstance service) async {
+    // Ensure Flutter binding is initialized first
+    WidgetsFlutterBinding.ensureInitialized();
     DartPluginRegistrant.ensureInitialized();
 
-    final Database db = await _initializeDatabase();
-    final NetworkService networkService = NetworkService();
-    final LocationService locationService = LocationService();
+    print('Background service started');
 
-    // Periodic data collection (every 5 minutes)
-    Timer.periodic(const Duration(minutes: 5), (timer) async {
-      try {
-        final location = await locationService.getCurrentLocation();
-        final metrics = await _collectNetworkMetrics(networkService);
-        
-        await _saveMetricsToLocalStorage(db, metrics, location);
-        service.invoke('update_notification', {
-          'content': 'Last update: ${DateTime.now().toString().split('.')[0]}',
-        });
+    try {
+      // Initialize database helper
+      final dbHelper = DatabaseHelper.instance;
+      await dbHelper.database; // This will create the database and table if needed
+      
+      final NetworkService networkService = NetworkService();
+      final LocationService locationService = LocationService();
 
-      } catch (e) {
-        print('Error collecting metrics: $e');
-      }
-    });
+      print('Services initialized successfully');
 
-    // Periodic sync with remote database (every 15 minutes when online)
-    _syncTimer?.cancel();
-    _syncTimer = Timer.periodic(Duration(minutes: _syncInterval), (timer) async {
-      await _syncDataWithRemoteDatabase(db);
-    });
-  }
+      // Verify database is working
+      final tableExists = await dbHelper.tableExists();
+      print('Database table exists: $tableExists');
+      
+      final metricsCount = await dbHelper.getMetricsCount();
+      print('Current metrics count: $metricsCount');
 
-  static Future<Database> _initializeDatabase() async {
-    return openDatabase(
-      join(await getDatabasesPath(), 'network_metrics.db'),
-      onCreate: (db, version) {
-        return db.execute(
-          '''CREATE TABLE network_metrics(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            networkType TEXT,
-            signalStrength INTEGER,
-            latency REAL,
-            jitter REAL,
-            downloadSpeed REAL,
-            uploadSpeed REAL,
-            provider TEXT,
-            location TEXT,
-            timestamp TEXT,
-            synced INTEGER DEFAULT 0
-          )''',
-        );
-      },
-      version: 1,
-    );
+      // Handle service messages
+      service.on('stopService').listen((event) {
+        print('Stop service requested');
+        _metricsTimer?.cancel();
+        _syncTimer?.cancel();
+        service.stopSelf();
+      });
+
+      // Handle clear data message
+      service.on('clearData').listen((event) async {
+        try {
+          await dbHelper.clearAllData();
+          print('All data cleared');
+        } catch (e) {
+          print('Error clearing data: $e');
+        }
+      });
+
+      // Periodic data collection (every 2 minutes for testing)
+      _metricsTimer = Timer.periodic(const Duration(minutes: 2), (timer) async {
+        try {
+          print('Collecting network metrics...');
+          
+          final location = await locationService.getCurrentLocation();
+          print('Location: $location');
+          
+          final metrics = await _collectNetworkMetrics(networkService);
+          print('Metrics collected: ${metrics.networkType}');
+          
+          // Use DatabaseHelper to insert metrics
+          final id = await dbHelper.insertMetrics(metrics, location);
+          print('Metrics saved with ID: $id');
+          
+          // Update notification with current stats
+          final totalCount = await dbHelper.getMetricsCount();
+          final unsyncedCount = (await dbHelper.getUnsyncedMetrics()).length;
+          
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: 'Network Monitor Active',
+              content: 'Total: $totalCount | Unsynced: $unsyncedCount | Last: ${DateTime.now().toString().split('.')[0]}',
+            );
+          }
+
+          print('Metrics collection completed successfully');
+
+        } catch (e) {
+          print('Error collecting metrics: $e');
+          // Continue running even if one collection fails
+          
+          // Update notification to show error
+          if (service is AndroidServiceInstance) {
+            service.setForegroundNotificationInfo(
+              title: 'Network Monitor (Error)',
+              content: 'Last error: ${DateTime.now().toString().split('.')[0]}',
+            );
+          }
+        }
+      });
+
+      // Periodic sync with remote database (every 15 minutes when online)
+      _syncTimer?.cancel();
+      _syncTimer = Timer.periodic(Duration(minutes: _syncInterval), (timer) async {
+        print('Starting data sync...');
+        await _syncDataWithRemoteDatabase(dbHelper);
+      });
+
+      print('Background service initialized successfully');
+
+    } catch (e) {
+      print('Error starting background service: $e');
+    }
   }
 
   static Future<NetworkMetrics> _collectNetworkMetrics(NetworkService networkService) async {
+    // Add timeout to prevent hanging
+    final completer = Completer<NetworkMetrics>();
+    
+    // Start collecting metrics
     networkService.collectMetrics();
-    return await networkService.metricsStream.first;
+    
+    // Set up timeout
+    Timer(const Duration(seconds: 30), () {
+      if (!completer.isCompleted) {
+        // Create dummy metrics if timeout occurs
+        final dummyMetrics = NetworkMetrics(
+          networkType: 'Timeout',
+          signalStrength: -999,
+          latency: 0.0,
+          jitter: 0.0,
+          downloadSpeed: 0.0,
+          uploadSpeed: 0.0,
+          provider: 'Timeout',
+          timestamp: DateTime.now(),
+        );
+        completer.complete(dummyMetrics);
+      }
+    });
+    
+    // Listen for metrics
+    networkService.metricsStream.first.then((metrics) {
+      if (!completer.isCompleted) {
+        completer.complete(metrics);
+      }
+    }).catchError((error) {
+      if (!completer.isCompleted) {
+        // Create dummy metrics if error occurs
+        final dummyMetrics = NetworkMetrics(
+          networkType: 'Error',
+          signalStrength: -999,
+          latency: 0.0,
+          jitter: 0.0,
+          downloadSpeed: 0.0,
+          uploadSpeed: 0.0,
+          provider: 'Error: $error',
+          timestamp: DateTime.now(),
+        );
+        completer.complete(dummyMetrics);
+      }
+    });
+    
+    return completer.future;
   }
 
-  static Future<void> _saveMetricsToLocalStorage(
-    Database db,
-    NetworkMetrics metrics,
-    String location,
-  ) async {
-    await db.insert(
-      'network_metrics',
-      {
-        'networkType': metrics.networkType,
-        'signalStrength': metrics.signalStrength,
-        'latency': metrics.latency,
-        'jitter': metrics.jitter,
-        'downloadSpeed': metrics.downloadSpeed,
-        'uploadSpeed': metrics.uploadSpeed,
-        'provider': metrics.provider,
-        'location': location,
-        'timestamp': metrics.timestamp.toIso8601String(),
-        'synced': 0,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  static Future<void> _syncDataWithRemoteDatabase(Database db) async {
+  static Future<void> _syncDataWithRemoteDatabase(DatabaseHelper dbHelper) async {
     try {
-      // Get unsynced records
-      final List<Map<String, dynamic>> unsynced = await db.query(
-        'network_metrics',
-        where: 'synced = ?',
-        whereArgs: [0],
-      );
+      // Get unsynced records using DatabaseHelper
+      final unsyncedRecords = await dbHelper.getUnsyncedMetrics();
 
-      if (unsynced.isEmpty) return;
+      print('Found ${unsyncedRecords.length} unsynced records');
 
-      // TODO: Implement your remote database sync logic here
-      // For example, using Firebase, REST API, etc.
+      if (unsyncedRecords.isEmpty) {
+        print('No records to sync');
+        return;
+      }
 
-      // Mark records as synced after successful upload
-      await db.update(
-        'network_metrics',
-        {'synced': 1},
-        where: 'synced = ?',
-        whereArgs: [0],
-      );
+      // For now, simulate successful sync after 2 seconds
+      print('Simulating remote sync...');
+      await Future.delayed(const Duration(seconds: 2));
+
+      // Mark all unsynced records as synced (for simulation)
+      final syncedCount = await dbHelper.markAllUnsyncedAsSynced();
+      print('Marked $syncedCount records as synced');
 
       // Save last sync time
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('last_sync', DateTime.now().toIso8601String());
+      await prefs.setInt('last_sync_count', syncedCount);
+
+      print('Data sync completed successfully');
 
     } catch (e) {
       print('Error syncing data: $e');
+      
+      // Save sync error info
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('last_sync_error', e.toString());
+      await prefs.setString('last_sync_error_time', DateTime.now().toIso8601String());
     }
   }
 
   Future<void> stopService() async {
     final service = FlutterBackgroundService();
+    _metricsTimer?.cancel();
     _syncTimer?.cancel();
-    await service.invoke('stopService');
+    
+    if (await service.isRunning()) {
+      service.invoke('stopService');
+    }
+  }
+
+  // Method to check if service is running
+  Future<bool> isServiceRunning() async {
+    final service = FlutterBackgroundService();
+    return await service.isRunning();
+  }
+
+  // Method to clear all data via service
+  Future<void> clearAllData() async {
+    final service = FlutterBackgroundService();
+    if (await service.isRunning()) {
+      service.invoke('clearData');
+    } else {
+      // If service is not running, clear directly
+      final dbHelper = DatabaseHelper.instance;
+      await dbHelper.clearAllData();
+    }
+  }
+
+  // Method to get comprehensive service status
+  Future<Map<String, dynamic>> getServiceStatus() async {
+    final service = FlutterBackgroundService();
+    final prefs = await SharedPreferences.getInstance();
+    final dbHelper = DatabaseHelper.instance;
+    
+    try {
+      final totalMetrics = await dbHelper.getMetricsCount();
+      final unsyncedMetrics = (await dbHelper.getUnsyncedMetrics()).length;
+      
+      return {
+        'isRunning': await service.isRunning(),
+        'totalMetrics': totalMetrics,
+        'unsyncedMetrics': unsyncedMetrics,
+        'syncedMetrics': totalMetrics - unsyncedMetrics,
+        'lastSync': prefs.getString('last_sync'),
+        'lastSyncCount': prefs.getInt('last_sync_count'),
+        'lastSyncError': prefs.getString('last_sync_error'),
+        'lastSyncErrorTime': prefs.getString('last_sync_error_time'),
+        'tableExists': await dbHelper.tableExists(),
+      };
+    } catch (e) {
+      return {
+        'isRunning': await service.isRunning(),
+        'error': e.toString(),
+        'lastSync': prefs.getString('last_sync'),
+        'lastSyncError': prefs.getString('last_sync_error'),
+      };
+    }
+  }
+
+  // Method to get metrics count from database
+  Future<int> getMetricsCount() async {
+    try {
+      final dbHelper = DatabaseHelper.instance;
+      return await dbHelper.getMetricsCount();
+    } catch (e) {
+      print('Error getting metrics count: $e');
+      return 0;
+    }
+  }
+
+  // Method to get recent metrics for debugging
+  Future<List<Map<String, dynamic>>> getRecentMetrics({int limit = 10}) async {
+    try {
+      final dbHelper = DatabaseHelper.instance;
+      final allMetrics = await dbHelper.getAllMetrics();
+      
+      // Return limited results
+      if (allMetrics.length <= limit) {
+        return allMetrics;
+      } else {
+        return allMetrics.sublist(0, limit);
+      }
+    } catch (e) {
+      print('Error getting recent metrics: $e');
+      return [];
+    }
+  }
+
+  // Method to get unsynced metrics count
+  Future<int> getUnsyncedCount() async {
+    try {
+      final dbHelper = DatabaseHelper.instance;
+      final unsyncedMetrics = await dbHelper.getUnsyncedMetrics();
+      return unsyncedMetrics.length;
+    } catch (e) {
+      print('Error getting unsynced count: $e');
+      return 0;
+    }
+  }
+
+  // Method to manually trigger sync
+  Future<void> triggerSync() async {
+    try {
+      final dbHelper = DatabaseHelper.instance;
+      await _syncDataWithRemoteDatabase(dbHelper);
+    } catch (e) {
+      print('Error in manual sync: $e');
+      rethrow;
+    }
+  }
+
+  // Method to force restart timers (useful for testing)
+  Future<void> restartTimers() async {
+    _metricsTimer?.cancel();
+    _syncTimer?.cancel();
+    
+    // Note: This would need to be called from within the service context
+    // to properly restart the timers. For external use, consider stopping 
+    // and restarting the entire service.
+    print('Timers cancelled. Restart service to reinitialize timers.');
   }
 }
